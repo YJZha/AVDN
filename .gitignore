@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+
+# Models / weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+pretrain_weights/
+*.onnx
+
+# Data / images
+datasets/
+train_images/
+val_images/
+readme_imgs/
+
+# Env / logs / IDE
+.env
+*.log
+.vscode/
