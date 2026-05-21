@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -73,6 +74,84 @@ class QwenVLAdapter(nn.Module):
         self.lstm_frame_tokens = lstm_frame_tokens
         self._diag_printed = False
         self.verbose = verbose
+
+    def encode_with_frame_window(self, texts, frame_histories, window_size, device="cuda"):
+        """
+        Qwen-as-memory: encode text + a fixed-size sliding window of recent
+        frames in one batched forward pass.  Qwen's own attention mechanism
+        relates the instruction to the visual history — no external memory
+        module is needed.
+
+        texts:          List[str], len = B  (navigation instruction / dialog)
+        frame_histories: List[List[np.ndarray]], len = B
+                         frame_histories[i] = all frames up to current step
+                         (BGR uint8, same format as obs['current_view'])
+        window_size:    int W — number of recent frames to keep.
+                         Early steps (fewer than W frames) are padded with
+                         black images at the front so every item has exactly
+                         W image slots → equal-length sequences → one batch.
+
+        Returns
+        -------
+        text_tokens : [B, seq_len, text_dim]  — for ET lang input
+        text_cls    : [B, text_dim]           — for lang_cls projection
+        """
+        try:
+            from PIL import Image as PILImage
+        except ImportError:
+            raise RuntimeError("Pillow is required for encode_with_frame_window")
+
+        B = len(texts)
+        W = max(window_size, 1)
+
+        # Determine image dimensions from the first available frame
+        sample_frame = next(
+            (f for hist in frame_histories for f in hist if f is not None), None
+        )
+        if sample_frame is not None:
+            img_h, img_w = sample_frame.shape[:2]
+        else:
+            img_h, img_w = 224, 224
+        black_pil = PILImage.fromarray(np.zeros((img_h, img_w, 3), dtype=np.uint8))
+
+        all_prompts = []
+        all_images_flat = []   # flat list length B*W, fed to processor
+
+        for text, hist in zip(texts, frame_histories):
+            # Take last W frames; pad front with black if fewer than W
+            window = list(hist[-W:]) if len(hist) >= W else hist
+            n_pad = W - len(window)
+            pil_window = [black_pil] * n_pad + [
+                PILImage.fromarray(f[:, :, ::-1].astype("uint8")) for f in window
+            ]
+
+            content = [{"type": "image"} for _ in range(W)]
+            content.append({"type": "text", "text": text})
+            messages = [{"role": "user", "content": content}]
+            prompt = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+            all_prompts.append(prompt)
+            all_images_flat.extend(pil_window)   # W images per item
+
+        # Single batched processor call (all items have identical prompt shape)
+        inputs = self.processor(
+            text=all_prompts,
+            images=all_images_flat,
+            return_tensors="pt",
+            padding=True,
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        outputs = self.qwen_model(
+            **inputs,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+        hidden = _get_last_hidden(outputs)   # [B, seq_len, text_dim]
+        text_cls = hidden[:, 0, :]           # [B, text_dim]
+        return hidden, text_cls
 
     def encode_text(self, texts, device="cuda"):
         inputs = self.processor(text=texts, return_tensors="pt", padding=True)

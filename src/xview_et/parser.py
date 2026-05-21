@@ -62,6 +62,13 @@ def parse_args():
     parser.add_argument('--distill_lang_cls_w', type=float, default=0.5)
     parser.add_argument('--distill_frame_w', type=float, default=1.0)
 
+    # Qwen episodic memory: feed text + all past frames to Qwen each step
+    # so Qwen's own attention acts as the memory module (no external memory).
+    parser.add_argument('--use_qwen_memory', action='store_true', default=False,
+                        help='Update lang/lang_cls each step via Qwen(text+all_past_frames)')
+    parser.add_argument('--qwen_memory_window', type=int, default=0,
+                        help='Max past frames kept in memory. 0 = unlimited (full history)')
+
     # ET
     parser.add_argument('--demb', type=int, default=768)
     parser.add_argument('--encoder_heads', type=int, default=12)

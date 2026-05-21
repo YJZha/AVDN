@@ -655,33 +655,41 @@ class NavCMTAgent:
                     base_lang_inputs.append('')
                 else:
                     base_lang_inputs.append(ob['instructions'])
-            text_tokens, text_cls = self.qwen_adapter.encode_text(base_lang_inputs)
-            lang_features, linear_cls = self.qwen_adapter.project_text(text_tokens, text_cls)
             if not self.args.train_val_on_full:
                 dialog_inputs = []
                 for i, ob in enumerate(obs):
                     dialog_inputs.append(ob['pre_dialogs'] + ob['instructions'])
-                text_tokens, text_cls = self.qwen_adapter.encode_text(dialog_inputs)
-                _, linear_cls = self.qwen_adapter.project_text(text_tokens, text_cls)
             else:
                 dialog_inputs = base_lang_inputs
             lang_inputs = dialog_inputs
 
-            if self.args.use_feature_distill:
-                with torch.no_grad():
-                    encoding = self.tokenizer(base_lang_inputs, padding=True, return_tensors="pt")
-                    input_ids = encoding['input_ids'].cuda()
-                    attention_mask = encoding['attention_mask'].cuda()
-                    teacher_lang, _, _ = self.lang_model(input_ids, attention_mask)
+            if getattr(self.args, 'use_qwen_memory', False):
+                # lang_features / linear_cls are updated every step inside the
+                # loop: Qwen jointly encodes text + a sliding window of past
+                # frames, so its internal attention IS the memory module.
+                lang_features, linear_cls = None, None
+            else:
+                text_tokens, text_cls = self.qwen_adapter.encode_text(base_lang_inputs)
+                lang_features, linear_cls = self.qwen_adapter.project_text(text_tokens, text_cls)
+                if not self.args.train_val_on_full:
+                    text_tokens, text_cls = self.qwen_adapter.encode_text(dialog_inputs)
+                    _, linear_cls = self.qwen_adapter.project_text(text_tokens, text_cls)
 
-                    encoding = self.tokenizer(dialog_inputs, padding=True, return_tensors="pt")
-                    input_ids = encoding['input_ids'].cuda()
-                    attention_mask = encoding['attention_mask'].cuda()
-                    _, teacher_cls, _ = self.lang_model(input_ids, attention_mask)
-                distill_lang_loss = (
-                    self.args.distill_lang_w * F.mse_loss(lang_features, teacher_lang)
-                    + self.args.distill_lang_cls_w * F.mse_loss(linear_cls, teacher_cls)
-                )
+                if self.args.use_feature_distill:
+                    with torch.no_grad():
+                        encoding = self.tokenizer(base_lang_inputs, padding=True, return_tensors="pt")
+                        input_ids = encoding['input_ids'].cuda()
+                        attention_mask = encoding['attention_mask'].cuda()
+                        teacher_lang, _, _ = self.lang_model(input_ids, attention_mask)
+
+                        encoding = self.tokenizer(dialog_inputs, padding=True, return_tensors="pt")
+                        input_ids = encoding['input_ids'].cuda()
+                        attention_mask = encoding['attention_mask'].cuda()
+                        _, teacher_cls, _ = self.lang_model(input_ids, attention_mask)
+                    distill_lang_loss = (
+                        self.args.distill_lang_w * F.mse_loss(lang_features, teacher_lang)
+                        + self.args.distill_lang_cls_w * F.mse_loss(linear_cls, teacher_cls)
+                    )
         else:
             lang_inputs = []
             for i, ob in enumerate(obs):
@@ -734,12 +742,15 @@ class NavCMTAgent:
         # Init the logs
         ml_loss = 0.
 
+        # Per-episode frame history for Qwen memory mode (raw BGR frames)
+        frame_history = [[] for _ in range(batch_size)]
+
         input = {
             'directions' : torch.zeros((batch_size, 0, 2)).cuda(),
             'frames': torch.zeros(batch_size, 0, 512, 49).cuda(),
             'lenths': [0 for _ in range(batch_size)],
-            'lang': lang_features,
-            'lang_cls': linear_cls,
+            'lang': lang_features,    # updated per-step when use_qwen_memory=True
+            'lang_cls': linear_cls,   # updated per-step when use_qwen_memory=True
         }
         # print("- initialize rollout takes %s seconds ---" % (time.time() - rollout_start_time))
         
@@ -753,6 +764,26 @@ class NavCMTAgent:
                 qwen_images = []
                 for i in range(len(obs)):
                     qwen_images.append(obs[i]['current_view'][:, :, ::-1].copy())
+
+                if getattr(self.args, 'use_qwen_memory', False):
+                    # Append current frame to each episode's history (skip ended)
+                    for i in range(batch_size):
+                        if not ended[i]:
+                            frame_history[i].append(obs[i]['current_view'].copy())  # BGR
+
+                    # Qwen jointly encodes text + sliding window of recent frames.
+                    # Its attention over the window IS the episodic memory.
+                    window_size = getattr(self.args, 'qwen_memory_window', 3) or 3
+                    mem_tokens, mem_cls = self.qwen_adapter.encode_with_frame_window(
+                        lang_inputs, frame_history, window_size=window_size
+                    )
+                    lang_features_t, linear_cls_t = self.qwen_adapter.project_text(
+                        mem_tokens, mem_cls
+                    )
+                    input['lang'] = lang_features_t
+                    input['lang_cls'] = linear_cls_t
+
+                # Compute per-step spatial visual features for ET frame accumulation
                 vision_tokens = self.qwen_adapter.encode_image(qwen_images)
                 image_size = (qwen_images[0].shape[1], qwen_images[0].shape[0])
                 im_feature = self.qwen_adapter.project_vision_for_et(vision_tokens, image_size=image_size)
